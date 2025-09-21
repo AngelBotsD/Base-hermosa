@@ -6,6 +6,7 @@ import { promisify } from "util"
 import { pipeline } from "stream"
 
 const streamPipe = promisify(pipeline)
+const MAX_FILE_SIZE = 60 * 1024 * 1024
 
 const handler = async (msg, { conn, text }) => {
   if (!text || !text.trim()) {
@@ -37,82 +38,84 @@ const handler = async (msg, { conn, text }) => {
   let videoDownloadUrl = null
   let calidadElegida = "Desconocida"
   let apiUsada = "Desconocida"
+  let errorLogs = []
 
   try {
-    const tryApi = async (apiName, buildUrl, controller) => {
-      for (const q of posibles) {
-        const apiUrl = buildUrl(q)
+    const tryApi = (apiName, urlBuilder) => {
+      return new Promise(async (resolve, reject) => {
+        const controller = new AbortController()
         try {
-          const r = await axios.get(apiUrl, {
-            timeout: 60000,
-            signal: controller.signal
-          })
-          if (apiName === "MayAPI" && r.data?.status && r.data?.result?.url) {
-            return {
-              url: r.data.result.url,
-              quality: r.data.result.quality || q,
-              api: "MayAPI"
+          for (const q of posibles) {
+            const apiUrl = urlBuilder(q)
+            const r = await axios.get(apiUrl, {
+              timeout: 60000,
+              signal: controller.signal
+            })
+            if (r.data?.status && (r.data?.result?.url || r.data?.data?.url)) {
+              resolve({
+                url: r.data.result?.url || r.data.data?.url,
+                quality: r.data.result?.quality || r.data.data?.quality || q,
+                api: apiName,
+                controller
+              })
+              return
             }
           }
-          if (apiName === "NeoxR" && r.data?.status && r.data?.data?.url) {
-            return {
-              url: r.data.data.url,
-              quality: r.data.data.quality || q,
-              api: "NeoxR"
-            }
-          }
-        } catch {
-          continue
+          reject(new Error(`${apiName}: No entregó un URL válido`))
+        } catch (err) {
+          reject(new Error(`${apiName}: ${err.message}`))
         }
-      }
-      throw new Error(`${apiName} no pudo obtener el video`)
+      })
     }
 
-    const controller1 = new AbortController()
-    const controller2 = new AbortController()
-
-    const mayApiPromise = tryApi(
-      "MayAPI",
-      (q) =>
-        `https://mayapi.ooguy.com/ytdl?url=${encodeURIComponent(
-          videoUrl
-        )}&type=mp4&quality=${q}&apikey=may-0595dca2`,
-      controller1
+    const mayApi = tryApi("MayAPI", q =>
+      `https://mayapi.ooguy.com/ytdl?url=${encodeURIComponent(videoUrl)}&type=mp4&quality=${q}&apikey=may-0595dca2`
     )
 
-    const neoxApiPromise = tryApi(
-      "NeoxR",
-      (q) =>
-        `https://api.neoxr.eu/api/youtube?url=${encodeURIComponent(
-          videoUrl
-        )}&type=video&quality=${q}&apikey=russellxz`,
-      controller2
+    const neoxApi = tryApi("NeoxR", q =>
+      `https://api.neoxr.eu/api/youtube?url=${encodeURIComponent(videoUrl)}&type=video&quality=${q}&apikey=russellxz`
     )
 
-    // Carrera entre las dos APIs
-    const winner = await Promise.race([mayApiPromise, neoxApiPromise])
+    let winner
+    try {
+      winner = await Promise.any([mayApi, neoxApi])
+    } catch (err) {
+      throw new Error(
+        "No se pudo obtener el video en ninguna calidad.\n\n*Logs:*\n" +
+        errorLogs.join("\n")
+      )
+    }
 
-    // Cancelamos la otra API
-    if (winner.api === "MayAPI") controller2.abort()
-    else controller1.abort()
+    ;[mayApi, neoxApi].forEach(p => {
+      if (p !== winner && p.controller) {
+        p.controller.abort()
+      }
+    })
 
     videoDownloadUrl = winner.url
     calidadElegida = winner.quality
     apiUsada = winner.api
 
-    if (!videoDownloadUrl) {
-      throw new Error("No se pudo obtener el video en ninguna calidad.")
-    }
-
     const tmp = path.join(process.cwd(), "tmp")
     if (!fs.existsSync(tmp)) fs.mkdirSync(tmp)
     const file = path.join(tmp, `${Date.now()}_vid.mp4`)
 
-    const dl = await axios.get(videoDownloadUrl, {
-      responseType: "stream",
-      timeout: 0
+    const dl = await axios.get(videoDownloadUrl, { responseType: "stream", timeout: 0 })
+    let totalSize = 0
+    dl.data.on("data", chunk => {
+      totalSize += chunk.length
+      if (totalSize > MAX_FILE_SIZE) {
+        dl.data.destroy()
+      }
     })
+
     await streamPipe(dl.data, fs.createWriteStream(file))
+
+    const stats = fs.statSync(file)
+    if (stats.size > MAX_FILE_SIZE) {
+      fs.unlinkSync(file)
+      throw new Error("El archivo excede el límite de 60 MB permitido por WhatsApp.")
+    }
 
     await conn.sendMessage(
       msg.key.remoteJid,
@@ -121,7 +124,6 @@ const handler = async (msg, { conn, text }) => {
         mimetype: "video/mp4",
         fileName: `${title}.mp4`,
         caption: `
-
 > *𝚅𝙸𝙳𝙴𝙾 𝙳𝙾𝚆𝙽𝙻𝙾𝙰𝙳𝙴𝚁*
 
 🎵 *𝚃𝚒́𝚝𝚞𝚕𝚘:* ${title}
